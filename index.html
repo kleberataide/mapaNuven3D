@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GOES-19 HT — Visualização 3D do Topo de Nuvens (Brasil)</title>
+  <script src="https://unpkg.com/deck.gl@9.0.22/dist.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0b1020;
+      color: #f1f5f9;
+      overflow: hidden;
+    }
+    #map {
+      position: absolute;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+    }
+    .panel {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      width: 320px;
+      background: rgba(15, 23, 42, 0.88);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+    }
+    .panel h1 {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .panel p {
+      font-size: 12px;
+      color: #cbd5e1;
+      margin-bottom: 12px;
+      line-height: 1.4;
+    }
+    .control {
+      margin-bottom: 12px;
+    }
+    .control label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: #e2e8f0;
+    }
+    .control input[type="range"],
+    .control input[type="file"] {
+      width: 100%;
+    }
+    .legend {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 8px;
+      font-size: 11px;
+      color: #cbd5e1;
+    }
+    .legend-bar {
+      height: 10px;
+      border-radius: 5px;
+      background: linear-gradient(90deg, #2563eb, #06b6d4, #22c55e, #eab308, #ef4444);
+    }
+    .legend-labels {
+      display: flex;
+      justify-content: space-between;
+    }
+    .tooltip {
+      position: fixed;
+      z-index: 20;
+      pointer-events: none;
+      background: rgba(2, 6, 23, 0.92);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      color: #f8fafc;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      display: none;
+      line-height: 1.45;
+    }
+    .status {
+      font-size: 11px;
+      color: #93c5fd;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="panel">
+    <h1>GOES-19 Cloud Top Height (3D)</h1>
+    <p>Arraste para girar, botão direito/Shift + arraste para inclinar e scroll para zoom.</p>
+
+    <div class="control">
+      <label for="fileInput"><span>Carregar GeoJSON local</span></label>
+      <input id="fileInput" type="file" accept=".geojson,.json" />
+    </div>
+
+    <div class="control">
+      <label for="exagSlider">
+        <span>Exagero vertical</span>
+        <span id="exagVal">25x</span>
+      </label>
+      <input id="exagSlider" type="range" min="1" max="80" step="1" value="25" />
+    </div>
+
+    <div class="control">
+      <label for="radiusSlider">
+        <span>Tamanho do ponto (m)</span>
+        <span id="radiusVal">9000</span>
+      </label>
+      <input id="radiusSlider" type="range" min="2000" max="25000" step="500" value="9000" />
+    </div>
+
+    <div class="legend">
+      <span>Altura do topo de nuvens (km)</span>
+      <div class="legend-bar"></div>
+      <div class="legend-labels">
+        <span>0 km</span>
+        <span>5 km</span>
+        <span>10 km</span>
+        <span>15+ km</span>
+      </div>
+    </div>
+
+    <div id="status" class="status">Carregando GOES19_HT_Brasil_3D.geojson...</div>
+  </div>
+
+  <div id="tooltip" class="tooltip"></div>
+
+  <script>
+    const { DeckGL, ScatterplotLayer } = deck;
+
+    const INITIAL_VIEW_STATE = {
+      longitude: -53.0,
+      latitude: -14.5,
+      zoom: 3.4,
+      pitch: 52,
+      bearing: -15
+    };
+
+    let featuresData = [];
+    let elevationExaggeration = 25;
+    let pointRadius = 9000;
+
+    const tooltipEl = document.getElementById("tooltip");
+    const statusEl = document.getElementById("status");
+
+    function heightToColor(htMeters) {
+      // Mapeia 0 m -> 16000 m para gradiente azul -> ciano -> verde -> amarelo -> vermelho
+      const t = Math.max(0, Math.min(1, htMeters / 16000));
+      const stops = [
+        [37, 99, 235],
+        [6, 182, 212],
+        [34, 197, 94],
+        [234, 179, 8],
+        [239, 68, 68]
+      ];
+      const scaled = t * (stops.length - 1);
+      const idx = Math.min(stops.length - 2, Math.floor(scaled));
+      const localT = scaled - idx;
+      const c0 = stops[idx];
+      const c1 = stops[idx + 1];
+      return [
+        Math.round(c0[0] + (c1[0] - c0[0]) * localT),
+        Math.round(c0[1] + (c1[1] - c0[1]) * localT),
+        Math.round(c0[2] + (c1[2] - c0[2]) * localT),
+        225
+      ];
+    }
+
+    function buildLayers() {
+      return [
+        new ScatterplotLayer({
+          id: "ht-3d-points",
+          data: featuresData,
+          pickable: true,
+          opacity: 0.9,
+          stroked: false,
+          filled: true,
+          radiusUnits: "meters",
+          radiusMinPixels: 2,
+          radiusMaxPixels: 18,
+          getPosition: d => [
+            d.geometry.coordinates[0],
+            d.geometry.coordinates[1],
+            (d.geometry.coordinates[2] || 0) * elevationExaggeration
+          ],
+          getRadius: () => pointRadius,
+          getFillColor: d => heightToColor(d.properties?.ht_m ?? d.geometry.coordinates[2] ?? 0),
+          onHover: info => {
+            if (info.object) {
+              const [lon, lat, rawH] = info.object.geometry.coordinates;
+              const htM = info.object.properties?.ht_m ?? rawH;
+              const htKm = (htM / 1000).toFixed(2);
+              tooltipEl.style.display = "block";
+              tooltipEl.style.left = `${info.x + 14}px`;
+              tooltipEl.style.top = `${info.y + 14}px`;
+              tooltipEl.innerHTML = `
+                <strong>Cloud Top Height (HT)</strong><br/>
+                Altura: <strong>${htM.toFixed(0)} m</strong> (${htKm} km)<br/>
+                Lat: ${lat.toFixed(3)}° | Lon: ${lon.toFixed(3)}°
+              `;
+            } else {
+              tooltipEl.style.display = "none";
+            }
+          },
+          updateTriggers: {
+            getPosition: [elevationExaggeration],
+            getRadius: [pointRadius]
+          }
+        })
+      ];
+    }
+
+    const deckgl = new DeckGL({
+      container: "map",
+      initialViewState: INITIAL_VIEW_STATE,
+      controller: true,
+      layers: buildLayers()
+    });
+
+    function loadGeoJsonObject(geojson) {
+      featuresData = Array.isArray(geojson.features) ? geojson.features : [];
+      deckgl.setProps({ layers: buildLayers() });
+      statusEl.textContent = `Carregados ${featuresData.length.toLocaleString("pt-BR")} pontos 3D.`;
+    }
+
+    // Tenta carregar automaticamente se servido via HTTP na mesma pasta
+    fetch("./GOES19_HT_Brasil_3D.geojson")
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => loadGeoJsonObject(data))
+      .catch(() => {
+        statusEl.textContent = "Selecione o arquivo .geojson acima ou abra via servidor HTTP local.";
+      });
+
+    // Permite abrir o arquivo diretamente do computador sem precisar de servidor
+    document.getElementById("fileInput").addEventListener("change", event => {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = e => {
+        try {
+          const parsed = JSON.parse(e.target.result);
+          loadGeoJsonObject(parsed);
+        } catch (err) {
+          statusEl.textContent = "Erro ao ler o arquivo GeoJSON.";
+        }
+      };
+      reader.readAsText(file);
+    });
+
+    document.getElementById("exagSlider").addEventListener("input", e => {
+      elevationExaggeration = Number(e.target.value);
+      document.getElementById("exagVal").textContent = `${elevationExaggeration}x`;
+      deckgl.setProps({ layers: buildLayers() });
+    });
+
+    document.getElementById("radiusSlider").addEventListener("input", e => {
+      pointRadius = Number(e.target.value);
+      document.getElementById("radiusVal").textContent = pointRadius.toString();
+      deckgl.setProps({ layers: buildLayers() });
+    });
+  </script>
+</body>
+</html>
